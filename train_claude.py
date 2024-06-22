@@ -27,7 +27,9 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model_claude import GPTConfig, GPT
+
+import time
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -72,6 +74,12 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
+
+
+# Add these to your config variables
+grow_interval = 100  # Grow the model every 10000 iterations
+grow_noise_scale = 1e-3
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -331,6 +339,49 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+
+    # Inside your training loop, add:
+    if iter_num > 0 and iter_num % grow_interval == 0 and master_process:
+        print(f"Growing model at iteration {iter_num}")
+        t_grow_start = time.time()
+        
+        # Grow the model
+        new_model = model.grow(noise_scale=grow_noise_scale)
+        
+        # Move the new model to the correct device
+        new_model = new_model.to(device)
+        
+        # Recompile if necessary
+        if compile:
+            print("Compiling grown model...")
+            new_model = torch.compile(new_model)
+        
+        # Wrap in DDP if necessary
+        if ddp:
+            new_model = DDP(new_model, device_ids=[ddp_local_rank])
+        
+        # Update the optimizer
+        optimizer = new_model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+        
+        # Update the model reference
+        del model
+        model = new_model
+        
+        # If using DDP, update raw_model reference
+        if ddp:
+            raw_model = model.module
+        else:
+            raw_model = model
+        
+        t_grow_end = time.time()
+        print(f"Model grown in {t_grow_end - t_grow_start:.2f} seconds")
+        print(f"New model parameters: {model.get_num_params():,}")
+
+
+# After the training loop, add:
+if master_process:
+    print(f"Final model parameters: {model.get_num_params():,}")
 
 if ddp:
     destroy_process_group()

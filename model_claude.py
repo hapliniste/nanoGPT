@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+import copy
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -329,25 +331,68 @@ class GPT(nn.Module):
 
         return idx
 
-def duplicate_and_scale_weights(layer):
+    # Add this method to the GPT class
+    def grow(self, noise_scale=1e-3):
+        return grow_gpt(self, noise_scale)
+    
+
+
+
+def grow_linear(layer, noise_scale=1e-3):
+    new_layer = nn.Linear(layer.in_features, layer.out_features * 2, bias=layer.bias is not None)
     with torch.no_grad():
-        weight = layer.weight.data
+        new_layer.weight[:layer.out_features] = layer.weight
+        new_layer.weight[layer.out_features:] = layer.weight + torch.randn_like(layer.weight) * noise_scale
         if layer.bias is not None:
-            bias = layer.bias.data
-        else:
-            bias = None
-        
-        new_weight = torch.cat([weight, weight], dim=1) / math.sqrt(2)
-        if bias is not None:
-            new_bias = torch.cat([bias, bias], dim=0) / math.sqrt(2)
-        else:
-            new_bias = None
+            new_layer.bias[:layer.out_features] = layer.bias
+            new_layer.bias[layer.out_features:] = layer.bias + torch.randn_like(layer.bias) * noise_scale
+    return new_layer
 
-        in_features = layer.in_features
-        out_features = new_weight.size(0)
-        new_layer = nn.Linear(in_features, out_features)
-        new_layer.weight = nn.Parameter(new_weight)
-        if new_bias is not None:
-            new_layer.bias = nn.Parameter(new_bias)
+def grow_attention(attn_layer, noise_scale=1e-3):
+    new_attn = copy.deepcopy(attn_layer)
+    new_attn.n_head *= 2
+    
+    # Grow query, key, value projections
+    new_attn.c_attn = grow_linear(attn_layer.c_attn, noise_scale)
+    
+    # The output projection remains the same size
+    return new_attn
 
-        return new_layer
+def grow_mlp(mlp_layer, noise_scale=1e-3):
+    new_mlp = copy.deepcopy(mlp_layer)
+    new_mlp.c_fc = grow_linear(mlp_layer.c_fc, noise_scale)
+    # The output projection (c_proj) remains the same size
+    return new_mlp
+
+def grow_block(block, noise_scale=1e-3):
+    new_block = copy.deepcopy(block)
+    new_block.attn = grow_attention(block.attn, noise_scale)
+    new_block.mlp = grow_mlp(block.mlp, noise_scale)
+    return new_block
+
+def grow_gpt(model, noise_scale=1e-3):
+    new_model = copy.deepcopy(model)
+    new_config = copy.deepcopy(model.config)
+    new_config.n_embd *= 2  # Double the embedding dimension
+    new_config.n_head *= 2  # Double the number of attention heads
+    
+    # Grow transformer blocks
+    new_model.transformer.h = nn.ModuleList([grow_block(block, noise_scale) for block in model.transformer.h])
+    
+    # Adjust the final layer norm
+    new_model.transformer.ln_f = LayerNorm(new_config.n_embd, bias=model.config.bias)
+    with torch.no_grad():
+        new_model.transformer.ln_f.weight[:model.config.n_embd] = model.transformer.ln_f.weight
+        new_model.transformer.ln_f.weight[model.config.n_embd:] = model.transformer.ln_f.weight
+        if model.config.bias:
+            new_model.transformer.ln_f.bias[:model.config.n_embd] = model.transformer.ln_f.bias
+            new_model.transformer.ln_f.bias[model.config.n_embd:] = model.transformer.ln_f.bias
+    
+    # The lm_head remains the same size to keep the output dimension constant
+    new_model.lm_head = nn.Linear(new_config.n_embd, model.config.vocab_size, bias=False)
+    with torch.no_grad():
+        new_model.lm_head.weight[:, :model.config.n_embd] = model.lm_head.weight
+        new_model.lm_head.weight[:, model.config.n_embd:] = 0
+    
+    new_model.config = new_config
+    return new_model
